@@ -11,6 +11,7 @@ use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use smol::io::AsyncReadExt;
+use std::path::PathBuf;
 use std::{
     collections::VecDeque,
     fmt::Write,
@@ -18,18 +19,18 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use crate::Event;
 use crate::assemble_excerpts::assemble_excerpts;
 use crate::retrieval_search::run_retrieval_searches;
-use crate::{Event, sweep_ai};
 use cloud_zeta2_prompt::write_codeblock;
 
 /// Search for relevant code
 ///
-/// For the best results, run multiple queries at once with a single invocation of this tool.
+/// Alaways run all queries at once with a single invocation of this tool.
 #[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SearchToolInput {
-    /// An array of queries to run for gathering context relevant to the next prediction
-    #[schemars(length(max = 3))]
+    /// An array of queries to run in parallel for gathering context
+    #[schemars(length(max = 5))]
     pub queries: Box<[SearchToolQuery]>,
 }
 
@@ -38,21 +39,7 @@ pub struct SearchToolInput {
 pub struct SearchToolQuery {
     /// A glob pattern to match file paths in the codebase to search in.
     pub glob: String,
-    // /// 2. Regular expressions to match syntax nodes **by their first line** and hierarchy.
-    // ///
-    // /// Subsequent regexes match nodes within the full content of the nodes matched by the previous regexes.
-    // ///
-    // /// Example: Searching for a `User` class
-    // ///     ["class\s+User"]
-    // ///
-    // /// Example: Searching for a `get_full_name` method under a `User` class
-    // ///     ["class\s+User", "def\sget_full_name"]
-    // ///
-    // /// Skip this field to match on content alone.
-    // #[schemars(length(max = 3))]
-    // #[serde(default)]
-    // pub syntax_node: Vec<String>,
-    /// A regular expression to match code contents
+    /// A regular expression to match code contents within the matched files.
     pub regex: String,
 }
 
@@ -89,7 +76,6 @@ pub struct OpenRouterProvider {
 
 pub async fn predict_jump(
     active_full_path: Arc<Path>,
-    active_buffer: BufferSnapshot,
     cursor_position: Point,
     events: VecDeque<Event>,
     project: Entity<Project>,
@@ -98,12 +84,20 @@ pub async fn predict_jump(
 ) -> Result<Option<JumpLocation>> {
     eprintln!("\n\nRequesting jump");
 
+    // todo!
+    let events = cx.update(|cx| {
+        events
+            .into_iter()
+            .filter_map(|event| event.to_request_event(cx))
+            .collect::<Vec<_>>()
+    })?;
+
     let search_queries = cx.background_spawn({
         let http_client = http_client.clone();
         let active_full_path = active_full_path.clone();
         async move {
-            let prompt =
-                build_jump_prompt(&active_full_path, &active_buffer, cursor_position, events)?;
+            let prompt = build_jump_prompt(&active_full_path, cursor_position, &events);
+            eprintln!("Jump prompt:\n{prompt}");
 
             let (tool_schema, tool_description) = TOOL_SCHEMA.clone();
 
@@ -211,7 +205,14 @@ pub async fn predict_jump(
         anyhow::bail!("No queries in jump response");
     }
 
-    let results = run_retrieval_searches(queries, project.clone(), None, cx).await?;
+    let results = run_retrieval_searches(
+        queries,
+        project.clone(),
+        #[cfg(feature = "eval-support")]
+        None,
+        cx,
+    )
+    .await?;
     dbg!(&results);
 
     if results.is_empty() {
@@ -224,15 +225,13 @@ pub async fn predict_jump(
     let mut result_buffers = HashMap::default();
 
     for (buffer, ranges) in results {
-        let (snapshot, full_path) = buffer.read_with(cx, |buffer, _cx| {
+        let (snapshot, full_path) = buffer.read_with(cx, |buffer, cx| {
             (
                 buffer.snapshot(),
                 buffer
                     .file()
-                    // todo! use full path but allow matching on just path
-                    .map(|file| file.path().as_std_path())
-                    .unwrap_or_else(|| Path::new("untitled"))
-                    .to_path_buf(),
+                    .map(|file| file.full_path(cx))
+                    .unwrap_or_else(|| PathBuf::from("untitled")),
             )
         })?;
 
@@ -336,100 +335,90 @@ pub async fn predict_jump(
 
     anyhow::Ok(Some(JumpLocation {
         buffer: buffer.clone(),
-        anchor: snapshot.anchor_after(Point::new(line, 0)),
+        anchor: snapshot.anchor_after(Point::new(line.saturating_sub(1), 0)),
     }))
 }
 
 pub fn build_jump_prompt(
     active_full_path: &Path,
-    active_buffer: &BufferSnapshot,
     cursor_position: Point,
-    events: VecDeque<Event>,
-) -> Result<String> {
-    let mut prompt = SEARCH_INSTRUCTIONS.to_string();
+    events: &[cloud_llm_client::predict_edits_v3::Event],
+) -> String {
+    let mut events_str = String::new();
 
-    if !events.is_empty() {
-        writeln!(&mut prompt, "\n## User Edits\n\n")?;
-        write_events(&mut prompt, events);
-    }
-
-    writeln!(&mut prompt, "## Cursor context\n")?;
-    let excerpt = EditPredictionExcerpt::select_from_buffer(
-        cursor_position,
-        active_buffer,
-        &crate::DEFAULT_EXCERPT_OPTIONS,
-        None,
-    )
-    .context("Can't get cursor excerpt because current line is too long")?;
-
-    write_codeblock(
-        &active_full_path,
-        &[Excerpt {
-            start_line: excerpt.line_range.start,
-            text: excerpt.text(active_buffer).body.into(),
-        }],
-        &[],
-        Line(active_buffer.max_point().row),
-        true,
-        &mut prompt,
-    );
-
-    writeln!(&mut prompt, "{TOOL_USE_REMINDER}")?;
-
-    Ok(prompt)
-}
-
-fn write_events(output: &mut String, events: VecDeque<Event>) {
-    if events.is_empty() {
-        return;
-    };
-
-    writeln!(output, "`````diff").unwrap();
     for event in events {
-        sweep_ai::write_event(event, output).unwrap();
+        write!(&mut events_str, "```diff\n{event}```\n\n").unwrap();
     }
-    writeln!(output, "`````\n").unwrap();
+
+    let events_str = events_str.trim_end_matches("\n\n");
+
+    SEARCH_INSTRUCTIONS
+        .to_string()
+        .replace(
+            "{CURSOR_PATH}",
+            active_full_path.display().to_string().as_str(),
+        )
+        .replace("{CURSOR_LINE}", &(cursor_position.row + 1).to_string())
+        .replace("{EDIT_HISTORY}", events_str)
 }
 
 const SEARCH_INSTRUCTIONS: &str = indoc! {r#"
     You are part of an edit prediction system in a code editor.
-    Your role is to predict the location of the next edit the user will make.
 
-    Analyze the history of edits made by the user in order to infer what they are currently trying to accomplish.
-    Then you should use the `search` tool to find code that informs where the next edit should be.
+    The user has made a series of changes, and your role is to predict a single far-away location
+    that needs to be edited as a result.
 
-    ## Search instructions
+    ## Cursor location
 
-    - Focus on locations in other files that may need to be updated following the users changes. For example:
-        - Type declarations that need to be updated to add an field, method, attribute, or implementation
-        - Function declarations whose signature needs to be updated to add or change an argument or return type
-        - Usages of a module, type, function, field, or variable whose declaration changed in the edit history
-        - Configuration files such as database schemas, or dependency lists such as in `Cargo.toml` or `package.json`
-        - Import regions that may need to be updated to add a missing import
-    - When the edit history includes changes to the declaration of a type or function, make sure to search for references
-      using the old state of the declaration rather than the new one, since the former are the ones that will require updates.
-    - Keep searches as targeted as possible
-    - Use `syntax_node` parameter whenever you're looking for a particular type, class, or function
-    - Avoid using wildcard globs if you already know the file path of the content you're looking for
-    - Always continue along the user's current trajectory, rather than changing course or going back.
+    The cursor is currently located at `{CURSOR_PATH}:{CURSOR_LINE}`.
+
+    Assume all necessary changes near this location are or will be done, and focus on changes that
+    are needed in other parts of the codebase.
+
+    ## Edit history
+
+    Carefully analyze the edit history in order to infer what the user is currently trying to accomplish,
+    and gather facts about the changes they have made.
+
+    {EDIT_HISTORY}
+
+    Use the `search` tool to find more information about the changes and potential locations for the next edit.
+
+    ### When you find changes to usages
+
+    - Did they pass a new argument to a function whose declaration hasn't been updated yet?
+    - Did they use a method on a type/class that hasn't been added yet?
+    - Did they use a method from a class/interface/trait that hasn't been implemented/derived on the type yet?
+    - Did they start using a package or library that hasn't been added to the project yet?
+
+    If the code suggets the item in question already existed, but is now being used in a different way,
+    search for its declaration in order to determine whether changes are necessary.
+
+    Alternatively, if the changes suggest the item is newly used, you should perform two parallel searches:
+        1. Search for the declaration of item to see whether it already exists and whether its definition needs to be updated.
+        2. Search for the class/type/module/configruation where it _should_ be defined, so that you can suggest jumping
+           to it if needs to be added.
+
+    ### When you find changes to declarations
+
+    - Did they change the definition of a type/class/table by adding, removing, or altering fields?
+    - Did they add an argument to a function?
+    - Did they split a function into multiple functions? Or merge multiple functions into one?
+    - Did they change the type of a field or function argument?
+    - Did they move a field from one type to another?
+
+    In these cases, you should search for usages of the affected item, so that you can see their current state
+    and suggest jumping to them if necessary.
 "#};
 
-const TOOL_USE_REMINDER: &str = indoc! {"
-    --
-    Analyze the user's intent in one to two sentences, then call the `search` tool. /no_think
-    Assume that no more edits are required in the current file.
-"};
-
 const JUMP_INSTRUCTIONS: &str = indoc! {"
-    Now analyze the search results, and explain your findings in 1 or 2 sentences, then if you think another edit is needed,
-    output the target file path and line number, like this:
+    Now analyze the search results, and explain your findings in 1 or 2 sentences.
+
+    If no more edits are needed, output `None`.
+
+    If another edit is needed, output the target file path and line number, like this:
 
     ```jump
-    project/file.rs:123
+    {project_name}/path/to/file.rs:123
     ```
-
-    Predict a single location!
-    You can't use any tools beyond this point, output only the target location based on the search results provided.
-    Do not attempt to search again.
-    Do not suggest a jump if an edit isn't necessary.
 "};

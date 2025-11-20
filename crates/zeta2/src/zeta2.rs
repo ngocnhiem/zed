@@ -929,7 +929,6 @@ impl Zeta {
                 let cursor_point = position.to_point(&snapshot);
                 let jump_result = jump::predict_jump(
                     full_path,
-                    snapshot,
                     cursor_point,
                     events,
                     project.clone(),
@@ -945,7 +944,7 @@ impl Zeta {
                                 &project,
                                 &jump.buffer,
                                 jump.anchor,
-                                allow_jump,
+                                false,
                                 cx,
                             )
                         })?
