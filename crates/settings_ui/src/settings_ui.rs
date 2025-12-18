@@ -154,7 +154,7 @@ trait AnySettingField {
         current_file: &SettingsUiFile,
         file_set_in: &settings::SettingsFile,
         cx: &App,
-    ) -> Option<Box<dyn Fn(&mut App)>>;
+    ) -> Option<Box<dyn Fn(&mut Window, &mut App)>>;
 
     fn json_path(&self) -> Option<&'static str>;
 }
@@ -184,7 +184,7 @@ impl<T: PartialEq + Clone + Send + Sync + 'static> AnySettingField for SettingFi
         current_file: &SettingsUiFile,
         file_set_in: &settings::SettingsFile,
         cx: &App,
-    ) -> Option<Box<dyn Fn(&mut App)>> {
+    ) -> Option<Box<dyn Fn(&mut Window, &mut App)>> {
         if file_set_in == &settings::SettingsFile::Default {
             return None;
         }
@@ -203,7 +203,7 @@ impl<T: PartialEq + Clone + Send + Sync + 'static> AnySettingField for SettingFi
         }
         let current_file = current_file.clone();
 
-        return Some(Box::new(move |cx| {
+        return Some(Box::new(move |window, cx| {
             let store = SettingsStore::global(cx);
             let default_value = (this.pick)(store.raw_default_settings());
             let is_set_somewhere_other_than_default = store
@@ -215,9 +215,15 @@ impl<T: PartialEq + Clone + Send + Sync + 'static> AnySettingField for SettingFi
             } else {
                 None
             };
-            update_settings_file(current_file.clone(), None, cx, move |settings, _| {
-                (this.write)(settings, value_to_set);
-            })
+            update_settings_file(
+                current_file.clone(),
+                None,
+                window,
+                cx,
+                move |settings, _| {
+                    (this.write)(settings, value_to_set);
+                },
+            )
             // todo(settings_ui): Don't log err
             .log_err();
         }));
@@ -1068,8 +1074,8 @@ fn render_settings_item(
                                         .icon_size(IconSize::Small)
                                         .tooltip(Tooltip::text("Reset to Default"))
                                         .on_click({
-                                            move |_, _, cx| {
-                                                reset_to_default(cx);
+                                            move |_, window, cx| {
+                                                reset_to_default(window, cx);
                                             }
                                         }),
                                 )
@@ -3544,20 +3550,33 @@ fn all_projects(
 fn update_settings_file(
     file: SettingsUiFile,
     file_name: Option<&'static str>,
+    window: &mut Window,
     cx: &mut App,
     update: impl 'static + Send + FnOnce(&mut SettingsContent, &App),
 ) -> Result<()> {
     telemetry::event!("Settings Change", setting = file_name, type = file.setting_type());
 
+    let original_workspace_window =
+        window
+            .root::<SettingsWindow>()
+            .flatten()
+            .and_then(|settings_window| {
+                settings_window.read_with(cx, |settings_window, _cx| {
+                    settings_window.original_window.clone()
+                })
+            });
+
     match file {
         SettingsUiFile::Project((worktree_id, rel_path)) => {
             let rel_path = rel_path.join(paths::local_settings_file_relative_path());
-            let Some((worktree, project)) = all_projects(None, cx).find_map(|project| {
-                project
-                    .read(cx)
-                    .worktree_for_id(worktree_id, cx)
-                    .zip(Some(project))
-            }) else {
+            let Some((worktree, project)) = all_projects(original_workspace_window.as_ref(), cx)
+                .find_map(|project| {
+                    project
+                        .read(cx)
+                        .worktree_for_id(worktree_id, cx)
+                        .zip(Some(project))
+                })
+            else {
                 anyhow::bail!("Could not find project with worktree id: {}", worktree_id);
             };
 
@@ -3618,10 +3637,16 @@ fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
             |editor, placeholder| editor.with_placeholder(placeholder),
         )
         .on_confirm({
-            move |new_text, cx| {
-                update_settings_file(file.clone(), field.json_path, cx, move |settings, _cx| {
-                    (field.write)(settings, new_text.map(Into::into));
-                })
+            move |new_text, window, cx| {
+                update_settings_file(
+                    file.clone(),
+                    field.json_path,
+                    window,
+                    cx,
+                    move |settings, _cx| {
+                        (field.write)(settings, new_text.map(Into::into));
+                    },
+                )
                 .log_err(); // todo(settings_ui) don't log err
             }
         })
@@ -3646,11 +3671,11 @@ fn render_toggle_button<B: Into<bool> + From<bool> + Copy>(
     Switch::new("toggle_button", toggle_state)
         .tab_index(0_isize)
         .on_click({
-            move |state, _window, cx| {
+            move |state, window, cx| {
                 telemetry::event!("Settings Change", setting = field.json_path, type = file.setting_type());
 
                 let state = *state == ui::ToggleState::Selected;
-                update_settings_file(file.clone(), field.json_path, cx, move |settings, _cx| {
+                update_settings_file(file.clone(), field.json_path, window, cx, move |settings, _cx| {
                     (field.write)(settings, Some(state.into()));
                 })
                 .log_err(); // todo(settings_ui) don't log err
@@ -3670,11 +3695,17 @@ fn render_number_field<T: NumberFieldType + Send + Sync>(
     let value = value.copied().unwrap_or_else(T::min_value);
     NumberField::new("numeric_stepper", value, window, cx)
         .on_change({
-            move |value, _window, cx| {
+            move |value, window, cx| {
                 let value = *value;
-                update_settings_file(file.clone(), field.json_path, cx, move |settings, _cx| {
-                    (field.write)(settings, Some(value));
-                })
+                update_settings_file(
+                    file.clone(),
+                    field.json_path,
+                    window,
+                    cx,
+                    move |settings, _cx| {
+                        (field.write)(settings, Some(value));
+                    },
+                )
                 .log_err(); // todo(settings_ui) don't log err
             }
         })
@@ -3702,13 +3733,19 @@ where
     let current_value = current_value.copied().unwrap_or(variants()[0]);
 
     EnumVariantDropdown::new("dropdown", current_value, variants(), labels(), {
-        move |value, cx| {
+        move |value, window, cx| {
             if value == current_value {
                 return;
             }
-            update_settings_file(file.clone(), field.json_path, cx, move |settings, _cx| {
-                (field.write)(settings, Some(value));
-            })
+            update_settings_file(
+                file.clone(),
+                field.json_path,
+                window,
+                cx,
+                move |settings, _cx| {
+                    (field.write)(settings, Some(value));
+                },
+            )
             .log_err(); // todo(settings_ui) don't log err
         }
     })
@@ -3753,10 +3790,11 @@ fn render_font_picker(
             Some(cx.new(move |cx| {
                 font_picker(
                     current_value.clone().into(),
-                    move |font_name, cx| {
+                    move |font_name, window, cx| {
                         update_settings_file(
                             file.clone(),
                             field.json_path,
+                            window,
                             cx,
                             move |settings, _cx| {
                                 (field.write)(settings, Some(font_name.into()));
@@ -3802,10 +3840,11 @@ fn render_theme_picker(
                 let current_value = current_value.clone();
                 theme_picker(
                     current_value,
-                    move |theme_name, cx| {
+                    move |theme_name, window, cx| {
                         update_settings_file(
                             file.clone(),
                             field.json_path,
+                            window,
                             cx,
                             move |settings, _cx| {
                                 (field.write)(
@@ -3854,10 +3893,11 @@ fn render_icon_theme_picker(
                 let current_value = current_value.clone();
                 icon_theme_picker(
                     current_value,
-                    move |theme_name, cx| {
+                    move |theme_name, window, cx| {
                         update_settings_file(
                             file.clone(),
                             field.json_path,
+                            window,
                             cx,
                             move |settings, _cx| {
                                 (field.write)(
