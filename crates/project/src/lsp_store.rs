@@ -1056,12 +1056,15 @@ impl LocalLspStore {
             .on_request::<lsp::request::ShowMessageRequest, _, _>({
                 let this = lsp_store.clone();
                 let name = name.to_string();
+                let adapter = adapter.clone();
                 move |params, cx| {
                     let this = this.clone();
                     let name = name.to_string();
+                    let adapter = adapter.clone();
                     let mut cx = cx.clone();
                     async move {
                         let actions = params.actions.unwrap_or_default();
+                        let message = params.message.clone();
                         let (tx, rx) = smol::channel::bounded(1);
                         let request = LanguageServerPromptRequest {
                             level: match params.typ {
@@ -1082,6 +1085,14 @@ impl LocalLspStore {
                             .is_ok();
                         if did_update {
                             let response = rx.recv().await.ok();
+                            if let Some(ref selected_action) = response {
+                                let context = language::PromptResponseContext {
+                                    message,
+                                    selected_action: selected_action.clone(),
+                                };
+                                adapter.process_prompt_response(&context, &mut cx)
+                            }
+
                             Ok(response)
                         } else {
                             Ok(None)
@@ -3300,8 +3311,10 @@ impl LocalLspStore {
         )
         .await
         .log_err();
-        this.update(cx, |this, _| {
+        this.update(cx, |this, cx| {
             if let Some(transaction) = transaction {
+                cx.emit(LspStoreEvent::WorkspaceEditApplied(transaction.clone()));
+
                 this.as_local_mut()
                     .unwrap()
                     .last_workspace_edits_by_language_server
@@ -3841,6 +3854,7 @@ pub enum LspStoreEvent {
         edits: Vec<(lsp::Range, Snippet)>,
         most_recent_edit: clock::Lamport,
     },
+    WorkspaceEditApplied(ProjectTransaction),
 }
 
 #[derive(Clone, Debug, Serialize)]
