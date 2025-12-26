@@ -347,7 +347,7 @@ impl FileHandle for std::fs::File {
     fn current_path(&self, _: &Arc<dyn Fs>) -> Result<PathBuf> {
         let fd = self.as_fd();
         let fd_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-        let new_path = std::fs::read_link(fd_path)?;
+        let new_path = dbg!(std::fs::read_link(dbg!(fd_path)))?;
         if new_path
             .file_name()
             .is_some_and(|f| f.to_string_lossy().ends_with(" (deleted)"))
@@ -370,9 +370,7 @@ impl FileHandle for std::fs::File {
         kif.kf_structsize = libc::KINFO_FILE_SIZE;
 
         let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_KINFO, kif.as_mut_ptr()) };
-        if result == -1 {
-            anyhow::bail!("fcntl returned -1".to_string());
-        }
+        anyhow::ensure!(result != -1, "fcntl returned -1");
 
         // SAFETY: `fcntl` will initialize the kif.
         let c_str = unsafe { CStr::from_ptr(kif.assume_init().kf_path.as_ptr()) };
@@ -396,9 +394,10 @@ impl FileHandle for std::fs::File {
         // Query required buffer size (in wide chars)
         let required_len =
             unsafe { GetFinalPathNameByHandleW(handle, &mut [], FILE_NAME_NORMALIZED) };
-        if required_len == 0 {
-            anyhow::bail!("GetFinalPathNameByHandleW returned 0 length");
-        }
+        anyhow::ensure!(
+            dbg!(required_len) != 0,
+            "GetFinalPathNameByHandleW returned 0 length"
+        );
 
         // Allocate buffer and retrieve the path
         let mut buf: Vec<u16> = vec![0u16; required_len as usize + 1];
@@ -408,7 +407,7 @@ impl FileHandle for std::fs::File {
         }
 
         let os_str: OsString = OsString::from_wide(&buf[..written as usize]);
-        Ok(PathBuf::from(os_str))
+        Ok(dbg!(PathBuf::from(os_str)))
     }
 }
 
