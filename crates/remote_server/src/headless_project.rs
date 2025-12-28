@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result, anyhow};
+use client::ProjectId;
 use collections::HashSet;
 use language::File;
 use lsp::LanguageServerId;
@@ -104,7 +105,7 @@ impl HeadlessProject {
             project::trusted_worktrees::track_worktree_trust(
                 worktree_store.clone(),
                 None::<RemoteHostLocation>,
-                Some((session.clone(), REMOTE_SERVER_PROJECT_ID)),
+                Some((session.clone(), ProjectId(REMOTE_SERVER_PROJECT_ID))),
                 None,
                 cx,
             );

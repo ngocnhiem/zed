@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use client::ProjectId;
 use collections::{HashMap, HashSet, IndexSet};
 use db::{
     kvp::KEY_VALUE_STORE,
@@ -843,6 +844,9 @@ impl Domain for WorkspaceDb {
                 user_name TEXT,
                 host_name TEXT
             ) STRICT;
+        ),
+        sql!(
+            ALTER TABLE trusted_worktrees ADD COLUMN project_id INTEGER;
         ),
         sql!(CREATE TABLE toolchains2 (
             workspace_id INTEGER,
@@ -1977,10 +1981,10 @@ impl WorkspaceDb {
             .collect::<Vec<_>>();
         let mut first_worktree;
         let mut last_worktree = 0_usize;
-        for (count, placeholders) in std::iter::once("(?, ?, ?)")
+        for (count, placeholders) in std::iter::once("(?, ?, ?, ?)")
             .cycle()
             .take(trusted_worktrees.len())
-            .chunks(MAX_QUERY_PLACEHOLDERS / 3)
+            .chunks(MAX_QUERY_PLACEHOLDERS / 4)
             .into_iter()
             .map(|chunk| {
                 let mut count = 0;
@@ -1996,7 +2000,7 @@ impl WorkspaceDb {
             first_worktree = last_worktree;
             last_worktree = last_worktree + count;
             let query = format!(
-                r#"INSERT INTO trusted_worktrees(absolute_path, user_name, host_name)
+                r#"INSERT INTO trusted_worktrees(absolute_path, user_name, host_name, project_id)
 VALUES {placeholders};"#
             );
 
@@ -2020,6 +2024,8 @@ VALUES {placeholders};"#
                         &host.as_ref().map(|host| host.host_identifier.as_str()),
                         next_index,
                     )?;
+                    next_index =
+                        statement.bind(&host.as_ref().map(|host| host.project_id.0), next_index)?;
                 }
                 statement.exec()
             })
@@ -2038,17 +2044,21 @@ VALUES {placeholders};"#
         let trusted_worktrees = DB.trusted_worktrees()?;
         Ok(trusted_worktrees
             .into_iter()
-            .filter_map(|(abs_path, user_name, host_name)| {
-                let db_host = match (user_name, host_name) {
-                    (_, None) => None,
-                    (None, Some(host_name)) => Some(RemoteHostLocation {
+            .filter_map(|(abs_path, user_name, host_name, project_id)| {
+                let db_host = match (user_name, host_name, project_id) {
+                    (None, Some(host_name), Some(project_id)) => Some(RemoteHostLocation {
                         user_name: None,
                         host_identifier: SharedString::new(host_name),
+                        project_id: ProjectId(project_id),
                     }),
-                    (Some(user_name), Some(host_name)) => Some(RemoteHostLocation {
-                        user_name: Some(SharedString::new(user_name)),
-                        host_identifier: SharedString::new(host_name),
-                    }),
+                    (Some(user_name), Some(host_name), Some(project_id)) => {
+                        Some(RemoteHostLocation {
+                            user_name: Some(SharedString::new(user_name)),
+                            host_identifier: SharedString::new(host_name),
+                            project_id: ProjectId(project_id),
+                        })
+                    }
+                    _ => None,
                 };
 
                 let abs_path = abs_path?;
@@ -2072,8 +2082,8 @@ VALUES {placeholders};"#
     }
 
     query! {
-        fn trusted_worktrees() -> Result<Vec<(Option<PathBuf>, Option<String>, Option<String>)>> {
-            SELECT absolute_path, user_name, host_name
+        fn trusted_worktrees() -> Result<Vec<(Option<PathBuf>, Option<String>, Option<String>, Option<u64>)>> {
+            SELECT absolute_path, user_name, host_name, project_id
             FROM trusted_worktrees
         }
     }

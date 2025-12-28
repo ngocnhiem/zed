@@ -994,6 +994,7 @@ async fn test_ssh_remote_worktree_trust(cx_a: &mut TestAppContext, server_cx: &m
     let remote_host = project_a.read_with(cx_a, |project, cx| {
         project
             .remote_connection_options(cx)
+            .map(|options| (0, options))
             .map(RemoteHostLocation::from)
     });
 

@@ -52,7 +52,9 @@ pub use project_search::Search;
 
 use anyhow::{Context as _, Result, anyhow};
 use buffer_store::{BufferStore, BufferStoreEvent};
-use client::{Client, Collaborator, PendingEntitySubscription, TypedEnvelope, UserStore, proto};
+use client::{
+    Client, Collaborator, PendingEntitySubscription, ProjectId, TypedEnvelope, UserStore, proto,
+};
 use clock::ReplicaId;
 
 use dap::client::DebugAdapterClient;
@@ -1295,9 +1297,12 @@ impl Project {
             if init_worktree_trust {
                 trusted_worktrees::track_worktree_trust(
                     worktree_store.clone(),
-                    Some(RemoteHostLocation::from(connection_options)),
+                    Some(RemoteHostLocation::from((
+                        REMOTE_SERVER_PROJECT_ID,
+                        connection_options,
+                    ))),
                     None,
-                    Some((remote_proto.clone(), REMOTE_SERVER_PROJECT_ID)),
+                    Some((remote_proto.clone(), ProjectId(REMOTE_SERVER_PROJECT_ID))),
                     cx,
                 );
             }
@@ -4872,6 +4877,7 @@ impl Project {
             let remote_host = this
                 .read(cx)
                 .remote_connection_options(cx)
+                .map(|options| (envelope.payload.project_id, options))
                 .map(RemoteHostLocation::from);
             trusted_worktrees.trust(
                 envelope
@@ -4906,6 +4912,7 @@ impl Project {
             let remote_host = this
                 .read(cx)
                 .remote_connection_options(cx)
+                .map(|options| (envelope.payload.project_id, options))
                 .map(RemoteHostLocation::from);
             trusted_worktrees.restrict(restricted_paths, remote_host, cx);
         })?;

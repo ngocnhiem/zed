@@ -271,16 +271,24 @@ impl WorktreeListDelegate {
                     if let Some((parent_worktree, _)) =
                         project.read(cx).find_worktree(repo_path, cx)
                     {
+                        let remote_host = project.read_with(cx, |project, cx| {
+                            project
+                                .lsp_store()
+                                .read(cx)
+                                .downstream_client()
+                                .or_else(|| project.lsp_store().read(cx).upstream_client())
+                                .map(|(_, project_id)| project_id)
+                                .zip(project.remote_connection_options(cx))
+                                .map(RemoteHostLocation::from)
+                        });
+
                         trusted_worktrees.update(cx, |trusted_worktrees, cx| {
                             if trusted_worktrees.can_trust(parent_worktree.read(cx).id(), cx) {
                                 trusted_worktrees.trust(
                                     HashSet::from_iter([PathTrust::AbsPath(
                                         new_worktree_path.clone(),
                                     )]),
-                                    project
-                                        .read(cx)
-                                        .remote_connection_options(cx)
-                                        .map(RemoteHostLocation::from),
+                                    remote_host,
                                     cx,
                                 );
                             }

@@ -80,7 +80,7 @@ use project::{
     debugger::{breakpoint_store::BreakpointStoreEvent, session::ThreadStatus},
     project_settings::ProjectSettings,
     toolchain_store::ToolchainStoreEvent,
-    trusted_worktrees::{TrustedWorktrees, TrustedWorktreesEvent},
+    trusted_worktrees::{RemoteHostLocation, TrustedWorktrees, TrustedWorktreesEvent},
 };
 use remote::{
     RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions,
@@ -6620,7 +6620,15 @@ impl Workspace {
                 .unwrap_or(false);
             if has_restricted_worktrees {
                 let project = self.project().read(cx);
-                let remote_host = project.remote_connection_options(cx);
+                let project_id = project
+                    .lsp_store()
+                    .read(cx)
+                    .downstream_client()
+                    .or_else(|| project.lsp_store().read(cx).upstream_client())
+                    .map(|(_, project_id)| project_id);
+                let remote_host = project_id
+                    .zip(project.remote_connection_options(cx))
+                    .map(RemoteHostLocation::from);
                 let worktree_store = project.worktree_store().downgrade();
                 self.toggle_modal(window, cx, |_, cx| {
                     SecurityModal::new(worktree_store, remote_host, cx)
